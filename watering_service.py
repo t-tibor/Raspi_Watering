@@ -74,18 +74,20 @@ class DailyScheduler(object):
             future = datetime(now.year, now.month, now.day, self.hour, self.minute)
             if future <= now:
                 future += timedelta(days=1)
+                self.logger.info(f'New target datetime: {future}')
+                self.logger.info(f'Total wait time: {(future-now).total_seconds()}sec')								
 
-	    # wait for the target datetime in small units
+           # wait for the target datetime in small units
             while future > now:
                 time_left_sec = (future - now).total_seconds()
                 if time_left_sec > 10:
-	  	    wait_time = 10
-	        else:
-	            wait_time = time_left_sec
+                    wait_time = 10
+                else:
+                    wait_time = time_left_sec
 
                 if wait_time > 0:
-  	          self.logger.info(f'Waiting for {time_left_sec}sec.')
-    	          sleep(delta_sec)
+                    self.logger.debug(f'Remaining wait time: {time_left_sec}sec.')
+                    sleep(wait_time)
 
                 now = datetime.today()
 
@@ -102,7 +104,7 @@ if __name__ == '__main__':
     irrigator = Irrigator(en_pin=20, drive_pin=21)
     default_irrigation_time_sec = 5
 
-    scheduler = DailyScheduler(hour=21, minute=5)
+    scheduler = DailyScheduler(hour=12, minute=0)
 
 
     def irrigation_task():
