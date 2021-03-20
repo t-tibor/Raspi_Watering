@@ -57,6 +57,8 @@ class Irrigator(object):
 
 
 class DailyScheduler(object):
+    log_update_period_sec = 3600
+
     def __init__(self, hour, minute):
         self.logger = logging.getLogger('Scheduler')
         self.logger.setLevel(logging.DEBUG)
@@ -80,8 +82,8 @@ class DailyScheduler(object):
            # wait for the target datetime in small units
             while future > now:
                 time_left_sec = (future - now).total_seconds()
-                if time_left_sec > 10:
-                    wait_time = 10
+                if time_left_sec > self.log_update_period_sec:
+                    wait_time = self.log_update_period_sec
                 else:
                     wait_time = time_left_sec
 

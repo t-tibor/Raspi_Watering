@@ -1,0 +1,13 @@
+#/bin/bash
+
+# Copy the service file to the systemd config folder
+sudo cp ./watering.service /etc/systemd/system/
+
+# Reload the systemd unis files
+sudo systemctl daemon-reload 
+
+# Set the temp_logger service to auto start mode
+sudo systemctl enable watering.service
+
+# And also start to make sure
+sudo systemctl start watering.service

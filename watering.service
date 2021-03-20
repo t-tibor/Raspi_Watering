@@ -1,0 +1,12 @@
+[Unit]
+Description=Python service for the plant watering.
+
+[Service]
+Type=simple
+Restart=always
+RestartSec=30
+User=pi
+ExecStart=bash /home/pi/projects/watering/start_watering_service
+
+[Install]
+WantedBy=multi-user.target

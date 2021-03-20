@@ -1,0 +1,10 @@
+#/bin/bash
+
+# enter the project directory
+cd ~/projects/watering
+
+# activate  the python virtual environment
+source ./bin/activate
+
+# start the service
+python3 watering_service.py
