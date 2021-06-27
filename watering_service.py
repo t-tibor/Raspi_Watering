@@ -1,47 +1,48 @@
 from gpiozero import LED
-from time import sleep
+import time
 import contextlib
 from datetime import datetime, timedelta
 import logging
-
+import queue
+import threading
 import paho.mqtt.client as mqtt
 
 
-class IrrigatorModel(object):
+class IrrigationHardwareModel(object):
     @contextlib.contextmanager
     def active(self):
-        #do stuff
+        # do stuff
         try:
             yield
         except:
-            #handle error
+            # handle error
             pass
         finally:
-            #cleanup
+            # cleanup
             pass
         
 
-class GPIOMotorModel(IrrigatorModel):
+class GPIOMotorModel(IrrigationHardwareModel):
     def __init__(self, en_pin, drive_pin):
         super().__init__()
         
-        self.logger         = logging.getLogger('MotorController')
+        self.logger = logging.getLogger('MotorController')
         self.logger.setLevel(logging.DEBUG)
         self.logger.debug(f'Creating MotorModel object with en_pin:{en_pin}, drive_pin:{drive_pin}')       
 
-        self.__en_pin       = en_pin
-        self.__drive_pin    = drive_pin
-        self.__en           = LED(en_pin)
-        self.__drive        = LED(drive_pin)
+        self.__en_pin = en_pin
+        self.__drive_pin = drive_pin
+        self.__en = LED(en_pin)
+        self.__drive = LED(drive_pin)
    
     @contextlib.contextmanager
     def active(self):
         try:
             self.__en.on()
-            sleep(0.1)
+            time.sleep(0.1)
             self.logger.debug('Motor is enabled.')
             self.__drive.on()        
-            sleep(0.1)
+            time.sleep(0.1)
             self.logger.debug('Motor is on.')
 
             yield
@@ -49,39 +50,43 @@ class GPIOMotorModel(IrrigatorModel):
             self.logger.exception('Execution raised while the motor was running.')
         finally:
             self.__drive.off()
-            sleep(0.1)
+            time.sleep(0.1)
             self.logger.debug('Motor is off.')
             self.__en.off()
-            sleep(0.1)
+            time.sleep(0.1)
             self.logger.debug('Motor is disabled.')
 
 
-class IrrigatorController(object):
+class IrrigationSystemController(object):
     log_update_period_sec = 3600
     
-    def __init__(self, model, viewers=[]):
-        self.__model    = model
-        self.__viewers  = viewers
-        self.logger     = logging.getLogger('IrrigatorController')
+    def __init__(self, model, viewers=()):
+        self._queue = queue.Queue()
+        self._watchdog_thread = threading.Thread(target=self._watchdog_func)
+        self._watchdog_stop_event = threading.Event()
+        self._watchdog_check_time = [8, 30]
+        self._gardener_thread = threading.Thread(target=self._gardener_func)
+        self._gardener_stop_event = threading.Event()
+
+        self.__model = model
+        self.__viewers = viewers
+        self.logger = logging.getLogger('IrrigationSystemController')
         self.logger.setLevel(logging.DEBUG)
 
-    def _irrigate(self, irrigation_time):
-        with self.__model.active():            
-            for viewer in self.__viewers:
-                viewer.state_changed(is_active=True)
+        self.watering_time_sec = 10
+        self.watering_blackout_time_sec = 5
+        self.watering_wet_time_sec = 5
+        self.last_watering_time = datetime.now()
 
-            self.logger.info(f'Watering for {irrigation_time}sec.')
-            sleep(irrigation_time)
-            self.logger.info('Watering done')
-
-            for viewer in self.__viewers:
-                viewer.state_changed(is_active=False)
+        self._state = 'Dry'
     
     @contextlib.contextmanager
     def open_viewers(self):
         try:
             for viewer in self.__viewers:
-                viewer.open()
+                viewer.open(self._queue)
+
+                self.notify_viewers(False)
 
             yield
         except:
@@ -90,125 +95,269 @@ class IrrigatorController(object):
             for viewer in self.__viewers:
                 viewer.close()
 
+    def notify_viewers(self, new_state):
+        try:
+            for viewer in self.__viewers:
+                viewer.set_state(new_state)
+        except:
+            pass
 
-    def do_periodic_irrigation(self, hour, minute, length_sec):
-        with self.open_viewers():        
-            self.logger.debug(f'Scheduler created with target time: {hour}h. {minute}min')
-            self.hour   = hour
-            self.minute = minute
+    def irrigate(self):
+        with self.__model.active():
+            self.notify_viewers(new_state=True)
 
-            while True:
-                # generate the new target datetime
+            self.logger.info(f'Watering for {self.watering_time_sec}sec.')
+            time.sleep(self.watering_time_sec)
+            self.logger.info('Watering done')
+
+            self.notify_viewers(new_state=False)
+
+        self.last_watering_time = datetime.now()
+
+    def _watchdog_func(self):
+        hour = self._watchdog_check_time[0]
+        minute = self._watchdog_check_time[1]
+        self.logger.debug(f'Scheduler created with target time: {hour}h. {minute}min')
+
+        while not self._watchdog_stop_event.isSet():
+            # generate the new target datetime
+            now = datetime.today()
+            future = datetime(now.year, now.month, now.day, hour, minute)
+            if future <= now:
+                future += timedelta(days=1)
+                self.logger.info(f'New target datetime: {future}')
+                self.logger.info(f'Total wait time: {(future-now).total_seconds()}sec')
+
+            # wait for the target datetime in small units
+            while not self._watchdog_stop_event.isSet() and (future > now):
+                time_left_sec = (future - now).total_seconds()
+                if time_left_sec > self.log_update_period_sec:
+                    wait_time = self.log_update_period_sec
+                else:
+                    wait_time = time_left_sec
+
+                if wait_time > 0:
+                    self.logger.debug(f'Remaining wait time: {time_left_sec}sec.')
+                    self._watchdog_stop_event.wait(wait_time)
+
                 now = datetime.today()
-                future = datetime(now.year, now.month, now.day, self.hour, self.minute)
-                if future <= now:
-                    future += timedelta(days=1)
-                    self.logger.info(f'New target datetime: {future}')
-                    self.logger.info(f'Total wait time: {(future-now).total_seconds()}sec')								
 
-               # wait for the target datetime in small units
-                while future > now:
-                    time_left_sec = (future - now).total_seconds()
-                    if time_left_sec > self.log_update_period_sec:
-                        wait_time = self.log_update_period_sec
-                    else:
-                        wait_time = time_left_sec
-    
-                    if wait_time > 0:
-                        self.logger.debug(f'Remaining wait time: {time_left_sec}sec.')
-                        sleep(wait_time)
-    
-                    now = datetime.today()
-
-
-                # do the task
+            # do the task
+            if not self._watchdog_stop_event.isSet():
                 self.logger.debug('Wait time ready.')
-                self._irrigate(length_sec)
+                self._queue.put('Watchdog')
+
+        self.logger.info('Exiting watchdog')
+
+    def _gardener_func(self):
+        with self.open_viewers():
+            while not self._gardener_stop_event.isSet():
+
+                if self._state == 'Watering':
+                    self.logger.info('State: Watering')
+                    self.irrigate()
+                    self._state = 'Blackout'
+
+                elif self._state == "Blackout":
+                    self.logger.info('State: Blackout')
+                    enter_time = datetime.now()
+                    while True:
+                        time_left = 10 - (datetime.now() - enter_time).total_seconds()
+                        if time_left < 0:
+                            time_left = 0
+                        try:
+                            cmd = self._queue.get(timeout=time_left)
+                            self._queue.task_done()
+                        except queue.Empty:
+                            cmd = 'TO'
+
+                        if cmd == 'TO':
+                            self._state = 'Wet'
+                            break
+                        if cmd is not None:
+                            self.logger.warning(f'Skipping cmd:"{cmd}" in state:"{self._state}"')
+                        else:
+                            break
+
+                elif self._state == 'Wet':
+                    self.logger.info('State: Wet')
+                    enter_time = datetime.now()
+                    while True:
+                        time_left = 30*60 - (datetime.now() - enter_time).total_seconds()
+                        if time_left < 0:
+                            time_left = 0
+
+                        try:
+                            cmd = self._queue.get(timeout=time_left)
+                            self._queue.task_done()
+                        except queue.Empty:
+                            cmd = 'TO'
+
+                        if cmd == 'Trigger':
+                            self._state = 'Watering'
+                            break
+                        elif cmd == 'TO':
+                            self._state = 'Dry'
+                            break
+                        elif cmd is not None:
+                            self.logger.warning(f'Skipping cmd:"{cmd}" in state:"{self._state}"')
+                        else:
+                            break
+
+                elif self._state == 'Dry':
+                    self.logger.info('State: Dry')
+                    while True:
+                        cmd = self._queue.get()
+                        self._queue.task_done()
+
+                        if cmd == 'Trigger' or cmd == 'Watchdog':
+                            self._state = 'Watering'
+                            break
+                        elif cmd is not None:
+                            self.logger.warning(f'Skipping cmd:"{cmd}" in state:"{self._state}"')
+                        else:
+                            break
+
+        self.logger.info('Exiting gardener')
+
+    def start(self):
+        self._gardener_thread.start()
+        self._watchdog_thread.start()
+
+    def stop(self):
+        self._watchdog_stop_event.set()
+        self._watchdog_thread.join()
+
+        self._gardener_stop_event.set()
+        self._queue.put(None)
+        self._gardener_thread.join()
 
 
-class IrrigatorViewer(object):
-    def open(self):
-        pass
+class IrrigationSystemMonitor(object):
+    def __init__(self):
+        self._state_queue = queue.Queue()
+        self._cmd_queue = None
+
+        self._worker = threading.Thread(target=self._worker_func)
+        self._worker_kill_event = threading.Event()
+
+    def open(self, cmd_queue):
+        self.on_open()
+        self._cmd_queue = cmd_queue
+        self._worker_kill_event.clear()
+        self._worker.start()
+        return self._state_queue
+
+    def set_state(self, new_state):
+        self._state_queue.put(new_state)
 
     def close(self):
+        self._worker_kill_event.set()
+        self._state_queue.put(None)
+        self._worker.join()
+        self.on_close()
+
+    def _worker_func(self):
+        while not self._worker_kill_event.isSet():
+            new_state = self._state_queue.get()
+            if new_state is not None:
+                self.on_state_changed(new_state)
+
+    def on_open(self):
         pass
 
-    def state_changed(self, is_active=False):
+    def on_trigger(self):
+        if self._cmd_queue is not None:
+            self._cmd_queue.put('Trigger')
+
+    def on_state_changed(self, is_active=False):
         pass
 
-    def error_handler(self, error_message):
+    def on_error(self, error_message):
+        pass
+
+    def on_close(self):
         pass
 
 
-class HassViewer(IrrigatorViewer):
+class HassMonitor(IrrigationSystemMonitor):
+    _state_mqtt_topic = "/irrigation/state"
+    _trigger_mqtt_topic = "/irrigation/trigger"
+
     def __init__(self, broker_address):
-        self._name = "Irrigator"
-        self._broker_address = broker_address       
-
-        self.logger     = logging.getLogger('HassViewer')
+        super().__init__()
+        self._name = "IrrigationSystemMonitor"
+        # Creating a class logger
+        self.logger = logging.getLogger('HassViewer')
         self.logger.setLevel(logging.DEBUG)
-
-        self._config_topic  = f"homeassistant/binary_sensor/{self._name}/config"
-        self._state_topic   = f"homeassistant/binary_sensor/{self._name}/state"
-
+        # Basic MQTT and HASS parameters
+        self._broker_address = broker_address
+        self._config_topic = f"homeassistant/binary_sensor/{self._name}/config"
         self.logger.debug('Home Assistant irrigator viewer created.')
-       
-    def open(self):
-        self.logger.info('Opening the viewer.')
-        self._client = mqtt.Client("Irrigator")
-        self._client.connect(self._broker_address)
-        self.logger.info("Connected to the MQTT broker.")
-        self._hass_register()
-        self.logger.info("Home Assistant entitiy registered.")
+        # Creating an MQTT client
+        self._client = mqtt.Client("IrrigatorClient")
+        self._client.on_connect = self._on_mqtt_connect
+        self._client.on_message = self._on_mqtt_message
 
-    def _hass_register(self):
+    def _on_mqtt_connect(self, client: mqtt.Client, _userdata, _flags, _rc):
+        self.logger.debug("Boker connection OK.")
+        self.logger.debug(f"Subscribint to the trigger mqtt topic: {self._trigger_mqtt_topic}")
+        client.subscribe(self._trigger_mqtt_topic)
+
+    def _on_mqtt_message(self, _client, _userdata, msg):
+        topic = msg.topic
+        payload = msg.payload
+        self.logger.debug(f'MQTT message received: topic:"{topic}", payload:"{payload}"')
+        if topic == self._trigger_mqtt_topic:
+            self.logger.info("Tiggering watering.")
+            self.on_trigger()
+
+    def on_open(self):
+        self.logger.info('Opening the viewer.')
+        self.logger.debug("Connecting to the broker.")
+        self._client.connect(self._broker_address)
+        self.logger.debug("Starting the event loop.")
+        self._client.loop_start()
+        self.logger.debug("Registering to the HomeAssistant MQTT discovery")
         topic = self._config_topic
         payload = '{' + f'''
                          "name": "{self._name}", 
                          "device_class": "moisture", 
-                         "state_topic": "{self._state_topic}",
+                         "state_topic": "{self._state_mqtt_topic}",
                          "payload_on": "1",
                          "payload_off": "0"
                          ''' + '}'
 
         self.logger.debug(f'Hass register: topic:{topic}, payload:{payload}')
         self._client.publish(topic, payload)
-        sleep(0.5)
+        time.sleep(0.5)
+        self.logger.info("Home Assistant entitiy registered.")
 
-    def _hass_deregister(self):
-        topic = self._config_topic
-        payload = ""
-        self.logger.debug('Hass deregister.')
-        self._client.publish(topic, payload)
-
-    def close(self):
+    def on_close(self):
         self.logger.info('Closing the viewer.')
-        self._hass_deregister()
+        self._client.loop_stop()
         self._client.disconnect()
         self._client = None
 
-    def state_changed(self, is_active=False):
-        topic = self._state_topic
+    def on_state_changed(self, is_active=False):
+        topic = self._state_mqtt_topic
         if is_active is True:
             payload = "1"
         else:
             payload = "0"
         self.logger.debug(f'Hass publish: topic:{topic}, payload:{payload}')
         self._client.publish(topic, payload)
-        
 
-    def error_handler(self, error_message):
+    def on_error(self, error_message):
         pass
 
 
 if __name__ == '__main__':
-    logging.basicConfig(format='%(asctime)-15s %(name)-12s %(levelname)-8s %(message)s')
+    logging.basicConfig(level=logging.DEBUG, format='%(asctime)-15s %(name)-12s %(levelname)-8s %(message)s')
 
-    motor = GPIOMotorModel(en_pin=20, drive_pin=21)
-    viewers = [ HassViewer("192.168.1.100") ]
-    controller = IrrigatorController(model=motor, viewers = viewers)
+    motor = IrrigationHardwareModel()
+    viewers = [HassMonitor("192.168.1.100")]
+    controller = IrrigationSystemController(model=motor, viewers=viewers)
 
-    default_irrigation_time_sec = 10
-    controller.do_periodic_irrigation(8, 30, default_irrigation_time_sec)
-    
+    controller.start()
 
