@@ -355,7 +355,7 @@ class HassMonitor(IrrigationSystemMonitor):
 if __name__ == '__main__':
     logging.basicConfig(level=logging.DEBUG, format='%(asctime)-15s %(name)-12s %(levelname)-8s %(message)s')
 
-    motor = IrrigationHardwareModel()
+    motor = GPIOMotorModel(en_pin=20, drive_pin=21)
     viewers = [HassMonitor("192.168.1.100")]
     controller = IrrigationSystemController(model=motor, viewers=viewers)
 
