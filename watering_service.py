@@ -234,41 +234,112 @@ class IrrigationSystemController(object):
 
 
 class IrrigationSystemMonitor(object):
-    def __init__(self):
-        self._state_queue = queue.Queue()
-        self._cmd_queue = None
-
+    def __init__(self, *args, **kwargs):
+        self._in_event_queue = queue.Queue()
         self._worker = threading.Thread(target=self._worker_func)
-        self._worker_kill_event = threading.Event()
-
+        # Creating a class logger
+        self.logger = logging.getLogger('IrrigationSystemMonitor')
+        self.logger.setLevel(logging.DEBUG)
+ 
+# -----------------------------------------
+# API functions
+# -----------------------------------------
     def open(self, cmd_queue):
-        self.on_open()
-        self._cmd_queue = cmd_queue
-        self._worker_kill_event.clear()
         self._worker.start()
-        return self._state_queue
+        event = {'msg':'open', 'arg':cmd_queue}
+        self._in_event_queue.put(event) 
 
     def set_state(self, new_state):
-        self._state_queue.put(new_state)
+        event = {'msg':'set_state', 'arg':new_state}
+        self._in_event_queue.put(event)
 
     def close(self):
-        self._worker_kill_event.set()
-        self._state_queue.put(None)
+        event = {'msg':'close', 'arg':None}
+        self._in_event_queue.put(event)
         self._worker.join()
-        self.on_close()
 
+    def trigger(self):
+        event={'msg':'Trigger', 'arg':None}
+        self._in_event_queue.put(event)
+
+# ----------------------------------------
+# Internal worker and state machine
+# ----------------------------------------
     def _worker_func(self):
-        while not self._worker_kill_event.isSet():
-            new_state = self._state_queue.get()
-            if new_state is not None:
-                self.on_state_changed(new_state)
+        old_state = 'idle'
+        state = 'idle'
+        self._out_event_queue=None
 
+        def get_event():
+            event=self._in_event_queue.get()
+            msg=event['msg']
+            arg=event['arg']
+            return msg, arg
+            
+        while True:
+            if state != old_state:
+                self.logger.info(f'State change: {old_state} -> {state}')
+                old_state = state
+
+            if state == 'idle':
+                msg, arg = get_event()
+                if msg == 'open':
+                    self._out_event_queue = arg                               
+                    state = 'connecting'
+                elif msg  == 'close':
+                    break
+
+            elif state == 'connecting':
+                try: 
+                    msg, arg = get_event(Timeout=1)
+                except:
+                    msg = arg = None
+
+                if msg == 'close':
+                    break
+                elif msg == None:
+                    # try to connect
+                    conn_ok = False
+                    try:
+                        self.on_open()
+                        conn_ok = True
+                    except:
+                        conn_ok = False
+                        self.logger.exception('Cannot open the monitor')
+                        time.sleep(5)
+
+                    if conn_ok == True:
+                        # connection established
+                        state = 'connected'
+
+            elif state == 'connected':
+                msg, arg = get_event()
+
+                if msg == 'close':
+                    try:
+                        self.on_close()
+                    except:
+                        self.logger.exception('Exception raised during on_close handling.')
+                    break
+                elif msg == 'set_state':
+                    try:
+                        self.on_state_changed(is_active=arg)
+                    except:
+                        self.logger.exception('Exception raised during set_state handling.')
+                        try:
+                            self.on_close()
+                        except:
+                            self.logger.exception('Exception during closing on state changed event handling failure.')
+                        state = 'connecting'
+                elif msg == 'Trigger':
+                    if self._out_event_queue is not None:
+                        self._out_event_queue.put('Trigger')                                           
+        
+# ----------------------------------------
+# Event handler functions to override
+# ----------------------------------------
     def on_open(self):
         pass
-
-    def on_trigger(self):
-        if self._cmd_queue is not None:
-            self._cmd_queue.put('Trigger')
 
     def on_state_changed(self, is_active=False):
         pass
@@ -287,7 +358,7 @@ class HassMonitor(IrrigationSystemMonitor):
     def __init__(self, broker_address):
         super().__init__()
         self._name = "IrrigationSystemMonitor"
-        # Creating a class logger
+        # Overriding the class logger
         self.logger = logging.getLogger('HassViewer')
         self.logger.setLevel(logging.DEBUG)
         # Basic MQTT and HASS parameters
@@ -301,24 +372,8 @@ class HassMonitor(IrrigationSystemMonitor):
 
     def _on_mqtt_connect(self, client: mqtt.Client, _userdata, _flags, _rc):
         self.logger.debug("Boker connection OK.")
-        self.logger.debug(f"Subscribint to the trigger mqtt topic: {self._trigger_mqtt_topic}")
-        client.subscribe(self._trigger_mqtt_topic)
 
-    def _on_mqtt_message(self, _client, _userdata, msg):
-        topic = msg.topic
-        payload = msg.payload
-        self.logger.debug(f'MQTT message received: topic:"{topic}", payload:"{payload}"')
-        if topic == self._trigger_mqtt_topic:
-            self.logger.info("Tiggering watering.")
-            self.on_trigger()
-
-    def on_open(self):
-        self.logger.info('Opening the viewer.')
-        self.logger.debug("Connecting to the broker.")
-        self._client.connect(self._broker_address)
-        self.logger.debug("Starting the event loop.")
-        self._client.loop_start()
-        self.logger.debug("Registering to the HomeAssistant MQTT discovery")
+        self.logger.debug("Registering to the HomeAssistant MQTT discovery")        
         topic = self._config_topic
         payload = '{' + f'''
                          "name": "{self._name}", 
@@ -332,6 +387,24 @@ class HassMonitor(IrrigationSystemMonitor):
         self._client.publish(topic, payload)
         time.sleep(0.5)
         self.logger.info("Home Assistant entitiy registered.")
+
+        self.logger.debug(f"Subscribint to the trigger mqtt topic: {self._trigger_mqtt_topic}")
+        client.subscribe(self._trigger_mqtt_topic)
+
+    def _on_mqtt_message(self, _client, _userdata, msg):
+        topic = msg.topic
+        payload = msg.payload
+        self.logger.debug(f'MQTT message received: topic:"{topic}", payload:"{payload}"')
+        if topic == self._trigger_mqtt_topic:
+            self.logger.info("Tiggering watering.")
+            self.trigger()
+
+    def on_open(self):
+        self.logger.info('Opening the viewer.')
+        self.logger.debug("Connecting to the broker.")
+        self._client.connect(self._broker_address)
+        self.logger.debug("Starting the event loop.")
+        self._client.loop_start()
 
     def on_close(self):
         self.logger.info('Closing the viewer.')
