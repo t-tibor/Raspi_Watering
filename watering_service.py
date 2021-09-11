@@ -23,25 +23,21 @@ class IrrigationHardwareModel(object):
         
 
 class GPIOMotorModel(IrrigationHardwareModel):
-    def __init__(self, en_pin, drive_pin):
+    def __init__(self, ch1, ch2, ch3, ch4):
         super().__init__()
         
         self.logger = logging.getLogger('MotorController')
         self.logger.setLevel(logging.DEBUG)
-        self.logger.debug(f'Creating MotorModel object with en_pin:{en_pin}, drive_pin:{drive_pin}')       
 
-        self.__en_pin = en_pin
-        self.__drive_pin = drive_pin
-        self.__en = LED(en_pin)
-        self.__drive = LED(drive_pin)
-   
+        self.__gpio_num = [ch1, ch2, ch3, ch4]
+        self.__gpio =  [ LED(ch) for ch in self.__gpio_num ]
+
+        self.logger.info('GPIOMotorModel created with pins: {self.__gpio_num}')
+    
     @contextlib.contextmanager
     def active(self):
         try:
-            self.__en.on()
-            time.sleep(0.1)
-            self.logger.debug('Motor is enabled.')
-            self.__drive.on()        
+            self.__gpio[0].on()
             time.sleep(0.1)
             self.logger.debug('Motor is on.')
 
@@ -49,12 +45,9 @@ class GPIOMotorModel(IrrigationHardwareModel):
         except:
             self.logger.exception('Execution raised while the motor was running.')
         finally:
-            self.__drive.off()
+            self.__gpio[0].off()
             time.sleep(0.1)
             self.logger.debug('Motor is off.')
-            self.__en.off()
-            time.sleep(0.1)
-            self.logger.debug('Motor is disabled.')
 
 
 class IrrigationSystemController(object):
@@ -428,7 +421,7 @@ class HassMonitor(IrrigationSystemMonitor):
 if __name__ == '__main__':
     logging.basicConfig(level=logging.DEBUG, format='%(asctime)-15s %(name)-12s %(levelname)-8s %(message)s')
 
-    motor = GPIOMotorModel(en_pin=20, drive_pin=21)
+    motor = GPIOMotorModel( ch1=5, ch2=6, ch3=13, ch4=26)
     viewers = [HassMonitor("192.168.1.100")]
     controller = IrrigationSystemController(model=motor, viewers=viewers)
 
